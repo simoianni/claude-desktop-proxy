@@ -1,0 +1,18 @@
+# Certificati TLS generati localmente
+*.pem
+certs/*.pem
+*.key
+*.crt
+*.p12
+*.pfx
+
+# Variabili d'ambiente (contiene API keys)
+.env
+
+# Node
+node_modules/
+npm-debug.log*
+
+# Windows
+Thumbs.db
+Desktop.ini

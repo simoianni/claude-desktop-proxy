@@ -1,0 +1,14 @@
+[req]
+distinguished_name = req_dn
+x509_extensions = v3_ca
+prompt = no
+
+[req_dn]
+CN = Claude-DS Proxy CA
+O = Local
+
+[v3_ca]
+basicConstraints = critical,CA:TRUE
+keyUsage = critical,keyCertSign,cRLSign
+subjectKeyIdentifier = hash
+authorityKeyIdentifier = keyid:always,issuer
