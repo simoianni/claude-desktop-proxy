@@ -1,0 +1,13 @@
+{
+  "name": "mcp-gemini-vision",
+  "version": "1.0.0",
+  "description": "MCP server per analisi immagini con Gemini Flash",
+  "type": "module",
+  "main": "index.js",
+  "scripts": {
+    "start": "node index.js"
+  },
+  "dependencies": {
+    "@modelcontextprotocol/sdk": "^1.13.0"
+  }
+}
