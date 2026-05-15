@@ -41,6 +41,20 @@ const ENDPOINTS = {
     model: "gemini-2.5-flash",
     type: "gemini",
   },
+  opencode: {
+    label: "OpenCode Go",
+    host: "opencode.ai",
+    basePath: "/zen/go/v1/chat/completions",
+    apiKey: process.env.OPENCODE_API_KEY || null,
+    modelMap: {
+      "claude-sonnet-4-5": "deepseek-v4-flash",
+      "claude-sonnet-4-6": "deepseek-v4-flash",
+      "claude-opus-4-7": "deepseek-v4-flash",
+      "claude-haiku-4-5-20251001": "deepseek-v4-flash",
+    },
+    defaultModel: "deepseek-v4-flash",
+    type: "opencode",
+  },
 };
 // ─────────────────────────────────────────────────────────
 
@@ -64,7 +78,12 @@ function resolveEndpoint(parsed) {
     }
   }
 
-  for (const [key, ep] of Object.entries(ENDPOINTS)) {
+  // Prefer opencode over deepseek when API key is configured
+  const endpointOrder = ["opencode", "deepseek", "gemini"];
+  for (const key of endpointOrder) {
+    const ep = ENDPOINTS[key];
+    if (!ep) continue;
+    if (key === "opencode" && !ep.apiKey) continue;
     if (ep.modelMap && ep.modelMap[origModel]) return { key, ep, upstreamModel: ep.modelMap[origModel] };
   }
   return { key: "deepseek", ep: ENDPOINTS.deepseek, upstreamModel: ENDPOINTS.deepseek.defaultModel };
@@ -84,6 +103,180 @@ function cleanSchema(obj) {
   }
   return cleaned;
 }
+
+// ── Anthropic → OpenAI format conversion ────────────────────
+
+function anthropicToOpenAIBody(parsed) {
+  const openAIMessages = [];
+  let systemContent = parsed.system || "";
+
+  for (const msg of parsed.messages || []) {
+    if (msg.role === "system") {
+      const text = typeof msg.content === "string" ? msg.content : msg.content.filter(b => b.type === "text").map(b => b.text).join("\n");
+      systemContent += (systemContent ? "\n" : "") + text;
+      continue;
+    }
+
+    if (msg.role === "user") {
+      if (typeof msg.content === "string") {
+        openAIMessages.push({ role: "user", content: msg.content });
+      } else if (Array.isArray(msg.content)) {
+        const parts = [];
+        for (const block of msg.content) {
+          if (block.type === "text") {
+            parts.push({ type: "text", text: block.text });
+          } else if (block.type === "image" && block.source) {
+            const mime = block.source.media_type || "image/jpeg";
+            parts.push({ type: "image_url", image_url: { url: `data:${mime};base64,${block.source.data}` } });
+          } else if (block.type === "tool_result") {
+            const toolText = typeof block.content === "string" ? block.content : JSON.stringify(block.content);
+            openAIMessages.push({ role: "tool", tool_call_id: block.tool_use_id, content: toolText });
+          }
+        }
+        if (parts.length > 0) {
+          openAIMessages.push({ role: "user", content: parts });
+        }
+      }
+    } else if (msg.role === "assistant") {
+      if (typeof msg.content === "string") {
+        openAIMessages.push({ role: "assistant", content: msg.content });
+      } else if (Array.isArray(msg.content)) {
+        const textParts = [];
+        const toolCalls = [];
+        for (const block of msg.content) {
+          if (block.type === "text") {
+            textParts.push(block.text);
+          } else if (block.type === "tool_use") {
+            toolCalls.push({
+              id: block.id,
+              type: "function",
+              function: { name: block.name, arguments: JSON.stringify(block.input || {}) },
+            });
+          }
+        }
+        const entry = { role: "assistant" };
+        entry.content = textParts.length > 0 ? textParts.join("\n") : null;
+        if (toolCalls.length > 0) entry.tool_calls = toolCalls;
+        openAIMessages.push(entry);
+      }
+    }
+  }
+
+  if (systemContent) {
+    openAIMessages.unshift({ role: "system", content: systemContent });
+  }
+
+  const body = {
+    model: parsed.model,
+    messages: openAIMessages,
+    max_tokens: Math.max(parsed.max_tokens || 8192, 1024),
+    stream: !!parsed.stream,
+    thinking: { type: "disabled" },
+  };
+
+  if (parsed.temperature !== undefined) body.temperature = parsed.temperature;
+  if (parsed.top_p !== undefined) body.top_p = parsed.top_p;
+
+  if (parsed.tools && Array.isArray(parsed.tools)) {
+    body.tools = parsed.tools.map(t => ({
+      type: "function",
+      function: { name: t.name, description: t.description || "", parameters: cleanSchema(t.input_schema) },
+    }));
+  }
+
+  return body;
+}
+
+function openAIToAnthropicResponse(raw, origModel) {
+  const choice = raw.choices?.[0] || {};
+  const msg = choice.message || {};
+  const content = [];
+
+  if (msg.content) {
+    content.push({ type: "text", text: msg.content });
+  } else if (msg.reasoning_content) {
+    content.push({ type: "text", text: msg.reasoning_content });
+  }
+
+  if (msg.tool_calls) {
+    for (const tc of msg.tool_calls) {
+      content.push({ type: "tool_use", id: tc.id, name: tc.function.name, input: JSON.parse(tc.function.arguments || "{}") });
+    }
+  }
+
+  const finishMap = { "stop": "end_turn", "length": "max_tokens", "tool_calls": "end_turn" };
+  const usage = raw.usage || {};
+
+  return {
+    id: "msg_" + Math.random().toString(36).substring(2, 15),
+    type: "message",
+    role: "assistant",
+    model: origModel,
+    content: content.length > 0 ? content : [{ type: "text", text: "" }],
+    stop_reason: finishMap[choice.finish_reason] || "end_turn",
+    stop_sequence: null,
+    usage: { input_tokens: usage.prompt_tokens || 0, output_tokens: usage.completion_tokens || 0 },
+  };
+}
+
+function openAIChunkToAnthropicSSE(chunk, origModel, state) {
+  const choice = chunk.choices?.[0] || {};
+  const delta = choice.delta || {};
+  const finishReason = choice.finish_reason;
+
+  const text = delta.content || delta.reasoning_content || "";
+
+  if (!state.started) {
+    state.started = true;
+    return {
+      type: "message_start",
+      message: {
+        id: "msg_" + Math.random().toString(36).substring(2, 15),
+        type: "message",
+        role: "assistant",
+        model: origModel,
+        content: [],
+        usage: { input_tokens: 0, output_tokens: 0 },
+      },
+    };
+  }
+
+  if (text && !state.blockStarted) {
+    state.blockStarted = true;
+    return {
+      type: "content_block_start",
+      index: 0,
+      content_block: { type: "text", text: "" },
+    };
+  }
+
+  if (text) {
+    return {
+      type: "content_block_delta",
+      index: 0,
+      delta: { type: "text_delta", text },
+    };
+  }
+
+  if (finishReason) {
+    const events = [];
+    if (state.blockStarted) {
+      events.push({ type: "content_block_stop", index: 0 });
+    }
+    const stopMap = { "stop": "end_turn", "length": "max_tokens", "tool_calls": "end_turn" };
+    events.push({
+      type: "message_delta",
+      delta: { stop_reason: stopMap[finishReason] || "end_turn", stop_sequence: null },
+      usage: { input_tokens: chunk.usage?.prompt_tokens || 0, output_tokens: chunk.usage?.completion_tokens || 0 },
+    });
+    events.push({ type: "message_stop" });
+    return events;
+  }
+
+  return null;
+}
+
+// ───────────────────────────────────────────────────────────
 
 function anthropicToGeminiContents(parsed, origModel) {
   const contents = [];
@@ -380,7 +573,7 @@ function handleRequest(req, res) {
     return res.end(JSON.stringify({
       status: "ok",
       proxy: "claude-deepseek-proxy",
-      endpoints: "DeepSeek + Gemini Flash (auto image routing)",
+      endpoints: "DeepSeek + Gemini Flash (auto image routing) + OpenCode Go",
       models,
     }));
   }
@@ -492,6 +685,107 @@ function handleRequest(req, res) {
       return;
     }
 
+    // ── Route to OpenCode (OpenAI format) ──────────
+    if (ep.type === "opencode") {
+      parsed.model = upstreamModel;
+      if (!parsed.max_tokens || parsed.max_tokens < 1024) parsed.max_tokens = 8192;
+
+      const openAIBody = anthropicToOpenAIBody(parsed);
+      const newBody = JSON.stringify(openAIBody);
+      const upstreamPath = ep.basePath;
+
+      const options = {
+        hostname: ep.host,
+        port: 443,
+        path: upstreamPath,
+        method: "POST",
+        headers: {
+          "Content-Type": "application/json",
+          "Content-Length": Buffer.byteLength(newBody),
+          "Authorization": "Bearer " + (ep.apiKey || ""),
+        },
+      };
+
+      console.log(`[proxy] [OPENCODE] model map: ${origModel} → ${upstreamModel}`);
+      console.log(`[proxy] [OPENCODE] → POST https://${ep.host}${upstreamPath} (${newBody.length} bytes, stream=${!!parsed.stream})`);
+
+      const upstream = https.request(options, (upstreamRes) => {
+        const isSSE = (upstreamRes.headers["content-type"] || "").includes("text/event-stream");
+
+        if (upstreamRes.statusCode >= 400) {
+          let errBuf = "";
+          upstreamRes.on("data", (c) => (errBuf += c));
+          upstreamRes.on("end", () => {
+            console.error(`[proxy] [OPENCODE] ⚠ ERROR ${upstreamRes.statusCode}: ${errBuf.substring(0, 500)}`);
+            if (!res.headersSent) res.writeHead(upstreamRes.statusCode, { "Content-Type": "application/json", "Access-Control-Allow-Origin": "*" });
+            res.end(JSON.stringify({ type: "error", error: { message: `opencode API ${upstreamRes.statusCode}` } }));
+          });
+          return;
+        }
+
+        if (isSSE) {
+          res.writeHead(200, { "Content-Type": "text/event-stream", "Access-Control-Allow-Origin": "*" });
+
+          let buffer = "";
+          const sseState = { started: false, blockStarted: false };
+
+          upstreamRes.on("data", (chunk) => {
+            buffer += chunk.toString();
+            const lines = buffer.split("\n");
+            buffer = lines.pop() || "";
+            for (const line of lines) {
+              if (line.startsWith("data: ")) {
+                const data = line.substring(6).trim();
+                if (data === "[DONE]") { res.write("data: [DONE]\n\n"); continue; }
+                try {
+                  const chunkEvent = JSON.parse(data);
+                  const events = openAIChunkToAnthropicSSE(chunkEvent, origModel, sseState);
+                  if (Array.isArray(events)) {
+                    for (const ev of events) {
+                      if (ev.type === "message_start" && ev.message?.model) ev.message.model = origModel;
+                      res.write("data: " + JSON.stringify(ev) + "\n\n");
+                    }
+                  } else if (events) {
+                    res.write("data: " + JSON.stringify(events) + "\n\n");
+                  }
+                } catch { res.write(line + "\n"); }
+              } else { res.write(line + "\n"); }
+            }
+          });
+
+          upstreamRes.on("end", () => {
+            if (buffer) res.write(buffer + "\n");
+            res.end();
+            console.log(`[proxy] [OPENCODE] ← stream complete`);
+          });
+        } else {
+          const respHeaders = { "Content-Type": "application/json", "Access-Control-Allow-Origin": "*" };
+          res.writeHead(upstreamRes.statusCode, respHeaders);
+
+          let d = "";
+          upstreamRes.on("data", (c) => (d += c));
+          upstreamRes.on("end", () => {
+            console.log(`[proxy] [OPENCODE] ← ${upstreamRes.statusCode} (${d.length} bytes)`);
+            try {
+              const raw = JSON.parse(d);
+              const anthropicResp = openAIToAnthropicResponse(raw, origModel);
+              res.end(JSON.stringify(anthropicResp));
+            } catch { res.end(d); }
+          });
+        }
+      });
+
+      upstream.on("error", (err) => {
+        console.error("[proxy] [OPENCODE] upstream error:", err.message);
+        if (!res.headersSent) res.writeHead(502, { "Content-Type": "application/json" });
+        res.end(JSON.stringify({ type: "error", error: { message: err.message } }));
+      });
+
+      upstream.write(newBody);
+      upstream.end();
+      return;
+    }
+
     // ── Image → Gemini OCR → DeepSeek pipeline ─────
     if (ep.type === "gemini") {
       handleImagePipeline(req, res, parsed, origModel);
@@ -574,6 +868,7 @@ function startServer() {
     console.log(`  Listening:    https://0.0.0.0:${PROXY_PORT}`);
     console.log(`  DeepSeek:     text only`);
     console.log(`  Gemini Flash: auto image/OCR routing`);
+    console.log(`  OpenCode Go:  OpenAI-compatible (deepseek-v4-flash)`);
     for (const [key, ep] of Object.entries(ENDPOINTS)) {
       if (ep.modelMap) {
         for (const [cModel, uModel] of Object.entries(ep.modelMap)) {
