@@ -72,7 +72,7 @@ check_prerequisites() {
 
 # ── LLM Provider choice ───────────────────────────────────────────────────
 choose_llm_provider() {
-  echo -e "${YELLOW}[2/8] Choose LLM provider${NC}"
+  echo -e "${YELLOW}[2/9] Choose LLM provider${NC}"
   echo ""
   echo "  Select the LLM provider for text generation:"
   echo ""
@@ -99,7 +99,7 @@ choose_llm_provider() {
 
 # ── API Keys ─────────────────────────────────────────────────────────────────
 ask_api_keys() {
-  echo -e "${YELLOW}[3/8] Configure API keys${NC}"
+  echo -e "${YELLOW}[3/9] Configure API keys${NC}"
   echo ""
   
   if [ "$LLM_PROVIDER" = "opencode" ]; then
@@ -359,7 +359,7 @@ print_done() {
   echo -e "  4. Start chatting!"
   echo ""
   echo -e "  ${BOLD}Stop the proxy:${NC}  pkill -f 'node.*server.js'"
-  echo -e "  ${BOLD}Restart:${NC}         cd $(pwd) && node server.js"
+  echo -e "  ${BOLD}Restart:${NC}         cd $SCRIPT_DIR && node proxy/server.js"
   echo ""
 }
 

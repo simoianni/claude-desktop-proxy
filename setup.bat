@@ -1,4 +1,5 @@
 @echo off
+chcp 65001 >nul
 setlocal enabledelayedexpansion
 title Claude DeepSeek Proxy - Setup
 
@@ -26,21 +27,40 @@ echo [1/9] Checking prerequisites...
 
 where node >nul 2>&1
 if %errorlevel% neq 0 (
-    echo   ✗ Node.js is not installed.
-    echo     Install it from https://nodejs.org (v18+)
-    pause
-    exit /b 1
+    echo   ! Node.js not found. Trying to install automatically...
+    echo.
+    :: Try winget first (available on Windows 10 1709+ and Windows 11)
+    where winget >nul 2>&1
+    if %errorlevel% equ 0 (
+        echo   Downloading Node.js LTS via winget...
+        winget install --id OpenJS.NodeJS.LTS --silent --accept-package-agreements --accept-source-agreements
+        if %errorlevel% neq 0 (
+            echo   ✗ winget install failed.
+            goto :node_manual
+        )
+        :: Refresh PATH so node is visible in this session
+        for /f "tokens=*" %%i in ('powershell -NoProfile -Command "[System.Environment]::GetEnvironmentVariable(\"PATH\",\"Machine\")"') do set "PATH=%%i;%PATH%"
+        where node >nul 2>&1
+        if %errorlevel% neq 0 (
+            echo   ✓ Node.js installed. Please close and reopen this window, then run setup.bat again.
+            pause
+            exit /b 0
+        )
+        echo   ✓ Node.js installed successfully
+    ) else (
+        :node_manual
+        echo   ✗ Could not install Node.js automatically.
+        echo.
+        echo     Please install Node.js manually:
+        echo     https://nodejs.org/en/download  (choose Windows Installer, LTS version)
+        echo.
+        echo     After installing, close this window and run setup.bat again.
+        pause
+        exit /b 1
+    )
 )
 echo   ✓ Node.js found
-
-where openssl >nul 2>&1
-if %errorlevel% neq 0 (
-    echo   ✗ OpenSSL is not in PATH.
-    echo     Install Git for Windows which includes OpenSSL
-    pause
-    exit /b 1
-)
-echo   ✓ OpenSSL found
+echo   (certificates generated via PowerShell - no OpenSSL needed)
 echo.
 
 :: ── [2/9] Choose LLM provider ─────────────────────────────────────────────
@@ -134,9 +154,9 @@ echo GEMINI_API_KEY=!GEMINI_KEY!
 echo   ✓ .env file created
 echo.
 
-:: ── [3/8] Generate TLS certificates ────────────────────────────────────────
+:: ── [4/9] Generate TLS certificates ────────────────────────────────────────
 echo [4/9] Generate TLS certificates...
-powershell -ExecutionPolicy Bypass -File "%CERTS_DIR%generate-certs.ps1"
+powershell -ExecutionPolicy Bypass -File "%CERTS_DIR%\generate-certs.ps1"
 if %errorlevel% neq 0 (
     echo   ✗ Certificate generation failed.
     pause
@@ -145,9 +165,9 @@ if %errorlevel% neq 0 (
 echo   ✓ Certificates generated in certs\
 echo.
 
-:: ── [4/8] Install CA certificate ───────────────────────────────────────────
+:: ── [5/9] Install CA certificate ───────────────────────────────────────────
 echo [5/9] Install CA certificate in system trust store...
-powershell -ExecutionPolicy Bypass -File "%CERTS_DIR%install-ca.ps1"
+powershell -ExecutionPolicy Bypass -File "%CERTS_DIR%\install-ca.ps1"
 if %errorlevel% neq 0 (
     echo   ✗ CA installation failed. Try running as Administrator.
     pause
@@ -156,41 +176,15 @@ if %errorlevel% neq 0 (
 echo   ✓ CA certificate installed
 echo.
 
-:: ── [5/8] Claude Desktop — manual steps ────────────────────────────────────
-echo [5/9] Claude Desktop — manual configuration
-echo.
-echo   Now you need to do TWO things in Claude Desktop:
-echo.
-echo   1. Enable Developer Mode:
-echo      Open Claude Desktop -^> Help -^> Troubleshooting
-echo      -^> Enable Developer Mode
-echo.
-echo   2. Configure third-party inference:
-echo      Go to Developer -^> Configure third-party inference
-echo      - Inference provider: Gateway
-echo      - Gateway base URL:   https://localhost:8877
-echo      - Gateway API key:    proxy-local-key
-echo      - Models to add:
-echo        - claude-sonnet-4-5  (label: sonnet 4.5)
-echo        - claude-opus-4-7   (label: claude opus 4.7)
-echo      Click 'Apply locally'
-echo.
-echo   WARNING: Do NOT sign in to claude.ai -- stay on the login screen.
-echo.
-pause
-echo.
-
-:: ── [6/8] Write developer_settings.json ────────────────────────────────────
+:: ── [6/9] Write developer_settings.json ────────────────────────────────────
 echo [6/9] Writing developer settings...
 
-:: Determine Claude Desktop paths on Windows
 set "CLAUDE_DIR=%APPDATA%\Claude"
 set "CLAUDE_3P_DIR=%LOCALAPPDATA%\Claude-3p"
 
 if not exist "%CLAUDE_DIR%" mkdir "%CLAUDE_DIR%"
 if not exist "%CLAUDE_3P_DIR%" mkdir "%CLAUDE_3P_DIR%"
 
-:: Write JSON to both locations
 (
 echo {
 echo   "allowDevTools": true,
@@ -212,20 +206,17 @@ echo }
 echo   ✓ %CLAUDE_3P_DIR%\developer_settings.json
 echo.
 
-:: ── [7/8] Write 3P configLibrary ───────────────────────────────────────────
+:: ── [7/9] Write 3P configLibrary ───────────────────────────────────────────
 echo [7/9] Writing third-party inference config...
 
 set "CONFIG_DIR=%CLAUDE_3P_DIR%\configLibrary"
 if not exist "%CONFIG_DIR%" mkdir "%CONFIG_DIR%"
-
 set "CONFIG_ID=claude-deepseek-proxy"
 
-:: _meta.json
 (
 echo {"applied":"%CONFIG_ID%"}
 ) > "%CONFIG_DIR%\_meta.json"
 
-:: Config JSON
 (
 echo {
 echo   "inferenceProvider": "gateway",
@@ -239,48 +230,96 @@ echo }
 echo   ✓ %CONFIG_DIR%\%CONFIG_ID%.json
 echo.
 
-:: ── [8/8] Start the proxy ──────────────────────────────────────────────────
+:: ── [8/9] Start the proxy ──────────────────────────────────────────────────
 echo [8/9] Starting the proxy...
 
-:: Check if already running
 tasklist /fi "imagename eq node.exe" 2>nul | find /i "node.exe" >nul
 if %errorlevel% equ 0 (
-    echo   ! Proxy may already be running. Kill it first if needed:
-    echo     taskkill /f /im node.exe
+    echo   ! A node.exe process is already running - it may be the proxy.
 )
 
 cd /d "%SCRIPT_DIR%"
 start "Claude DeepSeek Proxy" /MIN cmd /c "node proxy\server.js"
-echo   ✓ Proxy started on https://localhost:8877
-echo.
 
-:: ── Verification ───────────────────────────────────────────────────────────
-echo ═══ Verification ═══════════════════════════════════════
-echo.
+echo   Waiting for proxy to be ready...
+timeout /t 3 /nobreak >nul
 
-:: Test 1: TLS
-echo   Testing TLS connectivity...
 curl -sk https://localhost:8877/ >nul 2>&1
 if %errorlevel% equ 0 (
-    echo   ✓ TLS OK
+    echo   ✓ Proxy running on https://localhost:8877
 ) else (
-    echo   ✗ TLS FAIL - is the proxy running?
+    echo   ✗ Proxy did not respond - check the proxy window for errors.
+    pause
+    exit /b 1
+)
+echo.
+
+:: ── [9/9] Claude Desktop — manual configuration ─────────────────────────────
+echo [9/9] Claude Desktop — manual configuration
+echo.
+echo   The proxy is now running. Open Claude Desktop and do TWO things:
+echo.
+echo   1. Enable Developer Mode:
+echo      Help -^> Troubleshooting -^> Enable Developer Mode
+echo.
+echo   2. Configure third-party inference:
+echo      Developer -^> Configure third-party inference
+echo      - Inference provider:  Gateway
+echo      - Gateway base URL:    https://localhost:8877
+echo      - Gateway API key:     proxy-local-key
+echo      - Models to add:
+echo          claude-sonnet-4-5  (label: sonnet 4.5)
+echo          claude-opus-4-7    (label: claude opus 4.7)
+echo      Click 'Apply locally'
+echo.
+echo   WARNING: Do NOT sign in to claude.ai -- stay on the login screen.
+echo.
+pause
+echo.
+
+:: ── Auto-start at login ──────────────────────────────────────────────────────
+echo   Would you like the proxy to start automatically at Windows login?
+echo   (Recommended - otherwise you must run it manually each time)
+echo.
+set "AUTO_START="
+set /p "AUTO_START=  Set up auto-start? [Y/n]: "
+if "!AUTO_START!"=="" set "AUTO_START=Y"
+
+if /i "!AUTO_START!"=="Y" (
+    echo.
+    echo   Setting up Task Scheduler task...
+    set "TASK_NAME=ClaudeDeepSeekProxy"
+    set "PROXY_CMD=node proxy\server.js"
+    powershell -NoProfile -ExecutionPolicy Bypass -Command ^
+        "$action  = New-ScheduledTaskAction -Execute 'node.exe' -Argument 'proxy\server.js' -WorkingDirectory '%SCRIPT_DIR%';" ^
+        "$trigger = New-ScheduledTaskTrigger -AtLogOn;" ^
+        "$settings = New-ScheduledTaskSettingsSet -ExecutionTimeLimit ([TimeSpan]::Zero) -RestartCount 3 -RestartInterval (New-TimeSpan -Minutes 1);" ^
+        "Register-ScheduledTask -TaskName 'ClaudeDeepSeekProxy' -Action $action -Trigger $trigger -Settings $settings -RunLevel Highest -Force | Out-Null;" ^
+        "Write-Host '  OK'"
+    if %errorlevel% equ 0 (
+        echo   ✓ Task registered: proxy will start automatically at every login
+    ) else (
+        echo   ✗ Could not register task. Try running setup.bat as Administrator.
+    )
+) else (
+    echo   Skipped. To start the proxy manually run:
+    echo     start.bat   (or:  node proxy\server.js)
 )
 echo.
 
 :: ── Done ────────────────────────────────────────────────────────────────────
 echo ╔══════════════════════════════════════════════╗
-echo ║  Setup complete!                            ║
+echo ║  Setup complete!                             ║
 echo ╚══════════════════════════════════════════════╝
 echo.
 echo   Next steps:
 echo   1. Quit Claude Desktop completely (from tray too)
 echo   2. Reopen Claude Desktop
-echo   3. Select 'sonnet 4.5' or 'claude opus 4.7' from the picker
+echo   3. Select 'sonnet 4.5' or 'claude opus 4.7' from the model picker
 echo   4. Start chatting!
 echo.
-echo   Stop proxy:  Close the proxy window or taskkill /f /im node.exe
-echo   Restart:     Run start.bat
+echo   Stop proxy:    taskkill /f /im node.exe
+echo   Remove task:   schtasks /delete /tn ClaudeDeepSeekProxy /f
 echo.
 
 pause
