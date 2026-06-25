@@ -3,7 +3,7 @@ const path = require("path");
 const https = require("https");
 
 // Load .env if present
-const envPath = path.join(__dirname, ".env");
+const envPath = path.join(__dirname, "..", ".env");
 if (fs.existsSync(envPath)) {
   fs.readFileSync(envPath, "utf8").split("\n").forEach((line) => {
     const [k, ...v] = line.split("=");
@@ -15,7 +15,7 @@ if (fs.existsSync(envPath)) {
 
 // ── Proxy Port ───────────────────────────────────────────
 const PROXY_PORT = 8877;
-const DIR = __dirname;
+const DIR = path.join(__dirname, "..");
 
 // ── Endpoint Config ──────────────────────────────────────
 const ENDPOINTS = {

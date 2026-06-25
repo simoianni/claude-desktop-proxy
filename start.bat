@@ -4,5 +4,5 @@ echo.
 echo  Claude DeepSeek Proxy
 echo  ====================
 echo.
-node "%~dp0server.js"
+node "%~dp0proxy\server.js"
 pause

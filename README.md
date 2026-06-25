@@ -20,9 +20,11 @@ The proxy:
 
 | Claude Desktop model | Backend | Capability |
 |---|---|---|
-| `claude-sonnet-4-5` / `claude-sonnet-4-6` | DeepSeek V4 Flash | Text, reasoning |
-| `claude-opus-4-7` | DeepSeek V4 Pro | Text, reasoning |
+| `claude-sonnet-4-5` / `claude-sonnet-4-6` | DeepSeek V4 Flash (or OpenCode) | Text, reasoning |
+| `claude-opus-4-7` | DeepSeek V4 Pro (or OpenCode) | Text, reasoning |
 | Images (auto-routed) | **Gemini Flash 2.5** | OCR, image analysis, vision |
+
+> **LLM provider choice:** You can use either **DeepSeek API** (Anthropic-compatible) or **OpenCode Go** (OpenAI-compatible, hosts DeepSeek models). The setup script lets you choose. OpenCode is tried first if both keys are present.
 
 > Images are auto-detected and routed through a **pipeline**: Gemini Flash 2.5 describes the image → the description is sent to DeepSeek → DeepSeek generates the final response. No manual model switching needed.
 
@@ -188,7 +190,7 @@ chmod +x start.sh
 
 Or directly:
 ```bash
-node server.js
+node proxy/server.js
 ```
 
 ### 9. Start Claude Desktop
@@ -220,6 +222,15 @@ No manual model switching — just use `claude-sonnet-4-5` for everything.
 
 ```
 /
+├── setup.bat               - Windows automated setup (interactive)
+├── setup.sh                - Linux/macOS automated setup (interactive)
+├── start.bat               - Windows quick launcher
+├── start.sh                - Linux/macOS quick launcher
+├── README.md
+├── .env.example            - Environment variables template
+├── proxy/
+│   ├── server.js           - The proxy (DeepSeek / OpenCode + Gemini)
+│   └── test-proxy.js       - Connectivity test script
 ├── certs/
 │   ├── ca.cnf              - CA configuration
 │   ├── server.cnf          - Server certificate configuration
@@ -227,13 +238,7 @@ No manual model switching — just use `claude-sonnet-4-5` for everything.
 │   ├── generate-certs.sh   - Generate certificates (Linux/macOS)
 │   ├── install-ca.ps1      - Install CA in trust store (Windows)
 │   └── install-ca.sh       - Install CA in trust store (Linux/macOS)
-├── server.js               - The proxy (DeepSeek + Gemini pipeline)
-├── start.bat               - Windows launcher
-├── start.sh                - Linux/macOS launcher
-├── setup.bat               - Windows automated setup (interactive)
-├── setup.sh                - Linux/macOS automated setup (interactive)
-├── .env.example            - Environment variables template
-└── README.md
+└── mcp-gemini-vision/      - MCP Gemini Vision extension
 ```
 
 ## Troubleshooting

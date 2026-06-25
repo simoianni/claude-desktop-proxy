@@ -7,4 +7,4 @@ echo " Claude DeepSeek Proxy"
 echo " ====================="
 echo ""
 
-node "$DIR/server.js" "$@"
+node "$DIR/proxy/server.js" "$@"
