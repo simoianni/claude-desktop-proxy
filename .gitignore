@@ -16,6 +16,19 @@ npm-debug.log*
 # MCP
 mcp-gemini-vision/node_modules/
 
-# Windows
+# OS / editor
 Thumbs.db
 Desktop.ini
+.DS_Store
+*.swp
+*.swo
+.vscode/
+.idea/
+
+# Logs
+logs/
+*.log
+
+# Env variants
+.env.*
+!.env.example
