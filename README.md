@@ -57,6 +57,24 @@ cd claude-deepseek-proxy
 
 ### 2. Configure the API keys
 
+**🔧 Automated setup (recommended):**
+Run the interactive setup script:
+
+**Windows:**
+```cmd
+setup.bat
+```
+
+**Linux/macOS:**
+```bash
+chmod +x setup.sh
+./setup.sh
+```
+
+The script will ask for your API keys, generate certificates, install the CA, configure Claude Desktop, and verify everything works.
+
+> **Manual setup:** follow the steps below.
+
 Copy `.env.example` to `.env` and fill in your keys:
 
 ```bash
@@ -111,33 +129,40 @@ Restart Claude Desktop after installing the CA.
 
 ### 5. Enable Developer Mode in Claude Desktop
 
-1. Open Claude Desktop
+1. Open Claude Desktop (**do not sign in** — stay on the login screen)
 2. Go to **Help → Troubleshooting**
 3. Enable **Enable Developer Mode**
 
-Without this option, gateway settings are ignored.
+Without this option, third-party inference settings are ignored. A new **Developer** menu appears in the menu bar.
 
-### 6. Configure Claude Desktop — Identity & Models (UI)
+### 6. Configure third-party inference (models + gateway)
 
-In Claude Desktop **Settings → Identity & Models**, configure the model list as follows.
+Go to **Developer → Configure third-party inference**. In the configuration window:
 
-**Model list** (first entry is the picker default):
+| Section | Setting | Value |
+|---------|---------|-------|
+| Connection | Inference provider | **Gateway** |
+| Connection | Gateway base URL | `https://localhost:8877` |
+| Connection | Gateway API key | `proxy-local-key` (or any value) |
+| Connection → Models | Model ID | `claude-sonnet-4-5` |
+| Connection → Models | Display name | `sonnet 4.5` |
+| Connection → Models | Model ID | `claude-opus-4-7` |
+| Connection → Models | Display name | `claude opus 4.7` |
 
-| Field | Value |
-|-------|-------|
-| Model ID | `claude-sonnet-4-5` |
-| Display name | `sonnet 4.5` |
-
-| Field | Value |
-|-------|-------|
-| Model ID | `claude-opus-4-7` |
-| Display name | `claude opus 4.7` |
+Click **Apply locally** to save the configuration. Claude Desktop will relaunch.
 
 > For images, just use the same `claude-sonnet-4-5` model — the proxy auto-detects images and routes them through the Gemini OCR pipeline.
 
-### 7. Configure the gateway URL
+### 7. (Alternative) Configure the gateway URL via file
 
-In `developer_settings.json` (both `Claude` and `Claude-3p` directories):
+If you prefer file-based configuration, create `developer_settings.json` in **both** directories:
+
+| OS | Path |
+|----|------|
+| Windows | `%APPDATA%\Claude\developer_settings.json` |
+| Windows | `%LOCALAPPDATA%\Claude-3p\developer_settings.json` |
+| macOS | `~/Library/Application Support/Claude/developer_settings.json` |
+| macOS | `~/Library/Application Support/Claude-3p/developer_settings.json` |
 
 ```json
 {
@@ -205,6 +230,8 @@ No manual model switching — just use `claude-sonnet-4-5` for everything.
 ├── server.js               - The proxy (DeepSeek + Gemini pipeline)
 ├── start.bat               - Windows launcher
 ├── start.sh                - Linux/macOS launcher
+├── setup.bat               - Windows automated setup (interactive)
+├── setup.sh                - Linux/macOS automated setup (interactive)
 ├── .env.example            - Environment variables template
 └── README.md
 ```
