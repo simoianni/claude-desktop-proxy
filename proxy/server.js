@@ -482,7 +482,7 @@ function handleImagePipeline(req, res, parsed, origModel) {
         headers: {
           "Content-Type": "application/json",
           "Content-Length": Buffer.byteLength(newBody),
-          "x-api-key": deepseekEp.apiKey || req.headers["x-api-key"] || "",
+          "x-api-key": deepseekEp.apiKey || "",
           "anthropic-version": req.headers["anthropic-version"] || "2023-06-01",
         },
       };
@@ -493,7 +493,7 @@ function handleImagePipeline(req, res, parsed, origModel) {
         const isSSE = (dsRes.headers["content-type"] || "").includes("text/event-stream");
         res.writeHead(dsRes.statusCode, {
           "Content-Type": dsRes.headers["content-type"] || "application/json",
-          "Access-Control-Allow-Origin": "*",
+          // "Access-Control-Allow-Origin": "*", // DISABLED: Prevent Confused Deputy attacks from browsers
         });
 
         if (isSSE) {
@@ -551,9 +551,10 @@ function handleImagePipeline(req, res, parsed, origModel) {
 // ── Request handler ──────────────────────────────────────
 
 function handleRequest(req, res) {
-  res.setHeader("Access-Control-Allow-Origin", "*");
-  res.setHeader("Access-Control-Allow-Methods", "GET, POST, OPTIONS");
-  res.setHeader("Access-Control-Allow-Headers", "*");
+  // Security: CORS headers disabled – proxy is only for Claude Desktop
+  // res.setHeader("Access-Control-Allow-Origin", "*");
+  // res.setHeader("Access-Control-Allow-Methods", "GET, POST, OPTIONS");
+  // res.setHeader("Access-Control-Allow-Headers", "*");
 
   if (req.method === "OPTIONS") {
     res.writeHead(200);
@@ -579,10 +580,28 @@ function handleRequest(req, res) {
   }
 
   let body = "";
-  req.on("data", (chunk) => (body += chunk));
+  // Security: Limit request payload size to 50 MB to mitigate DoS attacks
+  req.on("data", (chunk) => {
+    body += chunk;
+    if (body.length > 50 * 1024 * 1024) { // 50MB limit
+      if (!res.headersSent) {
+        res.writeHead(413, { "Content-Type": "application/json" });
+        res.end(JSON.stringify({ error: "Payload Too Large" }));
+      }
+      req.destroy();
+    }
+  });
   req.on("end", () => {
+    if (req.destroyed) return;
+
     let parsed;
-    try { parsed = JSON.parse(body); } catch (e) {
+    // Security: Ensure payload is valid JSON object
+    try {
+      parsed = JSON.parse(body);
+      if (!parsed || typeof parsed !== "object") {
+        throw new Error("Payload must be a JSON object");
+      }
+    } catch (e) {
       res.writeHead(400, { "Content-Type": "application/json" });
       return res.end(JSON.stringify({ error: "Invalid JSON" }));
     }
@@ -624,10 +643,11 @@ function handleRequest(req, res) {
         port: 443,
         path: upstreamPath,
         method: "POST",
+        // Security: Do not forward client-supplied API key; use only configured key
         headers: {
           "Content-Type": "application/json",
           "Content-Length": Buffer.byteLength(newBody),
-          "x-api-key": ep.apiKey || req.headers["x-api-key"] || "",
+          "x-api-key": ep.apiKey || "",
           "anthropic-version": req.headers["anthropic-version"] || "2023-06-01",
         },
       };
@@ -637,7 +657,6 @@ function handleRequest(req, res) {
       const upstream = https.request(options, (upstreamRes) => {
         const isSSE = (upstreamRes.headers["content-type"] || "").includes("text/event-stream");
         const respHeaders = {
-          "Access-Control-Allow-Origin": "*",
           "Content-Type": upstreamRes.headers["content-type"] || "application/json",
         };
         res.writeHead(upstreamRes.statusCode, respHeaders);
@@ -699,6 +718,7 @@ function handleRequest(req, res) {
         port: 443,
         path: upstreamPath,
         method: "POST",
+        // Security: Do not forward client-supplied API key; use only configured key
         headers: {
           "Content-Type": "application/json",
           "Content-Length": Buffer.byteLength(newBody),
@@ -717,14 +737,22 @@ function handleRequest(req, res) {
           upstreamRes.on("data", (c) => (errBuf += c));
           upstreamRes.on("end", () => {
             console.error(`[proxy] [OPENCODE] ⚠ ERROR ${upstreamRes.statusCode}: ${errBuf.substring(0, 500)}`);
-            if (!res.headersSent) res.writeHead(upstreamRes.statusCode, { "Content-Type": "application/json", "Access-Control-Allow-Origin": "*" });
+            if (!res.headersSent) {
+              res.writeHead(upstreamRes.statusCode, { 
+                "Content-Type": "application/json" 
+                // "Access-Control-Allow-Origin": "*" // DISABLED: Prevent Confused Deputy attacks from browsers
+              });
+            }
             res.end(JSON.stringify({ type: "error", error: { message: `opencode API ${upstreamRes.statusCode}` } }));
           });
           return;
         }
 
         if (isSSE) {
-          res.writeHead(200, { "Content-Type": "text/event-stream", "Access-Control-Allow-Origin": "*" });
+          res.writeHead(200, { 
+            "Content-Type": "text/event-stream" 
+            // "Access-Control-Allow-Origin": "*" // DISABLED: Prevent Confused Deputy attacks from browsers
+          });
 
           let buffer = "";
           const sseState = { started: false, blockStarted: false };
@@ -759,7 +787,10 @@ function handleRequest(req, res) {
             console.log(`[proxy] [OPENCODE] ← stream complete`);
           });
         } else {
-          const respHeaders = { "Content-Type": "application/json", "Access-Control-Allow-Origin": "*" };
+          const respHeaders = { 
+            "Content-Type": "application/json" 
+            // "Access-Control-Allow-Origin": "*" // DISABLED: Prevent Confused Deputy attacks from browsers
+          };
           res.writeHead(upstreamRes.statusCode, respHeaders);
 
           let d = "";
@@ -863,9 +894,10 @@ function geminiToAnthropicSSE(geminiChunk, origModel, state) {
 // ── Startup ───────────────────────────────────────────────
 function startServer() {
   const server = https.createServer(tlsOptions, handleRequest);
-  server.listen(PROXY_PORT, "0.0.0.0", () => {
+  // Security: Bind server to localhost only to prevent external access
+server.listen(PROXY_PORT, "127.0.0.1", () => {
     console.log(`\n  Claude → Multi-Backend Proxy (HTTPS)`);
-    console.log(`  Listening:    https://0.0.0.0:${PROXY_PORT}`);
+    console.log(`  Listening:    https://127.0.0.1:${PROXY_PORT}`);
     console.log(`  DeepSeek:     text only`);
     console.log(`  Gemini Flash: auto image/OCR routing`);
     console.log(`  OpenCode Go:  OpenAI-compatible (deepseek-v4-flash)`);
