@@ -562,6 +562,25 @@ function handleRequest(req, res) {
   }
 
   if (req.method === "GET") {
+    // /v1/models — OpenAI-compatible models list (required by newer Claude Desktop connection test)
+    if (req.url === "/v1/models" || req.url.startsWith("/v1/models?")) {
+      const modelIds = new Set();
+      for (const ep of Object.values(ENDPOINTS)) {
+        if (ep.modelMap) {
+          for (const cModel of Object.keys(ep.modelMap)) modelIds.add(cModel);
+        }
+      }
+      const data = Array.from(modelIds).map(id => ({
+        id,
+        object: "model",
+        created: Math.floor(Date.now() / 1000),
+        owned_by: "proxy",
+      }));
+      res.writeHead(200, { "Content-Type": "application/json" });
+      return res.end(JSON.stringify({ object: "list", data }));
+    }
+
+    // Root status endpoint
     const models = {};
     for (const [key, ep] of Object.entries(ENDPOINTS)) {
       if (ep.modelMap) {
