@@ -171,6 +171,11 @@ generate_certs() {
 install_ca() {
   echo -e "${YELLOW}[5/9] Install CA certificate in system trust store...${NC}"
   
+  # Security & Usability: Ensure the installation script is executable to prevent Permission Denied errors
+  if [ "$OS" = "macos" ] || [ "$OS" = "linux" ]; then
+    chmod +x "$CERTS_DIR/install-ca.sh" 2>/dev/null || true
+  fi
+
   if [ "$OS" = "linux" ]; then
     echo -e "  ${YELLOW}⚠${NC} This step requires sudo (admin) privileges."
     sudo "$CERTS_DIR/install-ca.sh"

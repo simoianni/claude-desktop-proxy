@@ -125,6 +125,18 @@ schtasks /delete /tn ClaudeDeepSeekProxy /f
 
 ---
 
+## Security Hardening
+
+This fork implements several security fixes to ensure the proxy is safe for local use:
+
+- **Localhost Binding (`127.0.0.1`)**: The server listens exclusively on `127.0.0.1` instead of `0.0.0.0`. This prevents other devices on the same local area network (LAN) or the public internet from accessing your proxy and abusing your API keys.
+- **CORS Restrictions**: Wildcard CORS headers (`Access-Control-Allow-Origin: *`) have been disabled. This prevents malicious websites loaded in your web browser from executing CSRF-like attacks (Confused Deputy) to query your local proxy.
+- **Payload Size Limits**: Request bodies are capped at a maximum of **50 MB** to protect the node process against memory exhaustion (DoS attacks).
+- **Strict Payload Validation**: Request bodies are validated as valid JSON objects before processing to prevent crashes or unexpected behavior from malformed input formats.
+- **API Key Isolation**: Client-supplied `x-api-key` headers are not blindly forwarded to upstream endpoints, ensuring your configured API keys are kept isolated and secure.
+
+---
+
 ## Troubleshooting
 
 | Problem | Fix |
