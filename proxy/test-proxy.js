@@ -69,8 +69,8 @@ async function main() {
   console.log(`Body: ${r3.body}`);
   if (r3.status === 400) { ok++; console.log("  ✓ PASS"); } else { fail++; console.log("  ✗ FAIL"); }
 
-  // ── Test 4: OPTIONS (CORS preflight) ──
-  console.log("\n=== [TEST 4] OPTIONS (CORS) ===");
+  // ── Test 4: OPTIONS (CORS must stay disabled — security hardening) ──
+  console.log("\n=== [TEST 4] OPTIONS (CORS hardening) ===");
   const r4 = await new Promise((resolve) => {
     const req = https.request({
       hostname: HOST, port: PORT, path: "/messages", method: "OPTIONS",
@@ -82,8 +82,8 @@ async function main() {
     });
     req.end();
   });
-  console.log(`Status: ${r4.status}, CORS: ${r4.cors}`);
-  if (r4.status === 200 && r4.cors === "*") { ok++; console.log("  ✓ PASS"); } else { fail++; console.log("  ✗ FAIL"); }
+  console.log(`Status: ${r4.status}, CORS header: ${r4.cors ?? "(absent, as expected)"}`);
+  if (r4.status === 200 && r4.cors === undefined) { ok++; console.log("  ✓ PASS"); } else { fail++; console.log("  ✗ FAIL"); }
 
   // ── Test 5: Image pipeline (graceful fallback) ──
   console.log("\n=== [TEST 5] Image pipeline (graceful fallback) ===");

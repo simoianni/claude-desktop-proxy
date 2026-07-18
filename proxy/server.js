@@ -58,6 +58,12 @@ const ENDPOINTS = {
 };
 // ─────────────────────────────────────────────────────────
 
+// The text backend the user actually configured (OpenCode Go takes priority
+// over DeepSeek if both keys are present, mirroring resolveEndpoint()).
+function getPrimaryTextEndpoint() {
+  return ENDPOINTS.opencode.apiKey ? "opencode" : "deepseek";
+}
+
 // Load TLS certs
 const tlsOptions = {
   key: fs.readFileSync(path.join(DIR, "certs", "server-key.pem"), "utf8"),
@@ -86,7 +92,11 @@ function resolveEndpoint(parsed) {
     if (key === "opencode" && !ep.apiKey) continue;
     if (ep.modelMap && ep.modelMap[origModel]) return { key, ep, upstreamModel: ep.modelMap[origModel] };
   }
-  return { key: "deepseek", ep: ENDPOINTS.deepseek, upstreamModel: ENDPOINTS.deepseek.defaultModel };
+  // Unknown model id: fall back to whichever text provider is actually configured,
+  // instead of always DeepSeek (which may have no API key set).
+  const fallbackKey = getPrimaryTextEndpoint();
+  const fallbackEp = ENDPOINTS[fallbackKey];
+  return { key: fallbackKey, ep: fallbackEp, upstreamModel: fallbackEp.defaultModel };
 }
 
 function cleanSchema(obj) {
@@ -204,7 +214,7 @@ function openAIToAnthropicResponse(raw, origModel) {
     }
   }
 
-  const finishMap = { "stop": "end_turn", "length": "max_tokens", "tool_calls": "end_turn" };
+  const finishMap = { "stop": "end_turn", "length": "max_tokens", "tool_calls": "tool_use" };
   const usage = raw.usage || {};
 
   return {
@@ -223,12 +233,14 @@ function openAIChunkToAnthropicSSE(chunk, origModel, state) {
   const choice = chunk.choices?.[0] || {};
   const delta = choice.delta || {};
   const finishReason = choice.finish_reason;
-
-  const text = delta.content || delta.reasoning_content || "";
+  const events = [];
 
   if (!state.started) {
     state.started = true;
-    return {
+    state.nextBlockIndex = 0;
+    state.textBlockIndex = null;
+    state.toolBlocks = new Map(); // OpenAI tool_call index -> { anthropicIndex, id, name }
+    events.push({
       type: "message_start",
       message: {
         id: "msg_" + Math.random().toString(36).substring(2, 15),
@@ -238,42 +250,65 @@ function openAIChunkToAnthropicSSE(chunk, origModel, state) {
         content: [],
         usage: { input_tokens: 0, output_tokens: 0 },
       },
-    };
+    });
   }
 
-  if (text && !state.blockStarted) {
-    state.blockStarted = true;
-    return {
-      type: "content_block_start",
-      index: 0,
-      content_block: { type: "text", text: "" },
-    };
-  }
-
+  const text = delta.content || delta.reasoning_content || "";
   if (text) {
-    return {
-      type: "content_block_delta",
-      index: 0,
-      delta: { type: "text_delta", text },
-    };
+    if (state.textBlockIndex === null) {
+      state.textBlockIndex = state.nextBlockIndex++;
+      events.push({ type: "content_block_start", index: state.textBlockIndex, content_block: { type: "text", text: "" } });
+    }
+    events.push({ type: "content_block_delta", index: state.textBlockIndex, delta: { type: "text_delta", text } });
+  }
+
+  // OpenAI streams tool calls incrementally: id/name arrive once, then
+  // `function.arguments` arrives fragment by fragment across chunks.
+  if (Array.isArray(delta.tool_calls)) {
+    for (const tc of delta.tool_calls) {
+      const oaIndex = tc.index ?? 0;
+      let block = state.toolBlocks.get(oaIndex);
+      if (!block) {
+        block = {
+          anthropicIndex: state.nextBlockIndex++,
+          id: tc.id || ("toolu_" + Math.random().toString(36).substring(2, 15)),
+          name: tc.function?.name || "",
+        };
+        state.toolBlocks.set(oaIndex, block);
+        events.push({
+          type: "content_block_start",
+          index: block.anthropicIndex,
+          content_block: { type: "tool_use", id: block.id, name: block.name, input: {} },
+        });
+      }
+      const argsPiece = tc.function?.arguments;
+      if (argsPiece) {
+        events.push({
+          type: "content_block_delta",
+          index: block.anthropicIndex,
+          delta: { type: "input_json_delta", partial_json: argsPiece },
+        });
+      }
+    }
   }
 
   if (finishReason) {
-    const events = [];
-    if (state.blockStarted) {
-      events.push({ type: "content_block_stop", index: 0 });
+    if (state.textBlockIndex !== null) {
+      events.push({ type: "content_block_stop", index: state.textBlockIndex });
     }
-    const stopMap = { "stop": "end_turn", "length": "max_tokens", "tool_calls": "end_turn" };
+    for (const block of state.toolBlocks.values()) {
+      events.push({ type: "content_block_stop", index: block.anthropicIndex });
+    }
+    const stopMap = { "stop": "end_turn", "length": "max_tokens", "tool_calls": "tool_use" };
     events.push({
       type: "message_delta",
       delta: { stop_reason: stopMap[finishReason] || "end_turn", stop_sequence: null },
       usage: { input_tokens: chunk.usage?.prompt_tokens || 0, output_tokens: chunk.usage?.completion_tokens || 0 },
     });
     events.push({ type: "message_stop" });
-    return events;
   }
 
-  return null;
+  return events;
 }
 
 // ───────────────────────────────────────────────────────────
@@ -398,12 +433,191 @@ function geminiToAnthropicResponse(geminiResp, origModel) {
   };
 }
 
+// ── Shared text-backend senders (used by the main handler and the image
+// pipeline, so both honor whichever provider — DeepSeek or OpenCode Go —
+// the user actually configured) ─────────────────────────────────────────
+
+function sendAnthropicRequest(ep, parsed, req, res, origModel) {
+  const newBody = JSON.stringify(parsed);
+  const upstreamPath = ep.basePath + req.url.split("?")[0];
+  const options = {
+    hostname: ep.host,
+    port: 443,
+    path: upstreamPath,
+    method: "POST",
+    // Security: Do not forward client-supplied API key; use only configured key
+    headers: {
+      "Content-Type": "application/json",
+      "Content-Length": Buffer.byteLength(newBody),
+      "x-api-key": ep.apiKey || "",
+      "anthropic-version": req.headers["anthropic-version"] || "2023-06-01",
+    },
+  };
+
+  console.log(`[proxy] → POST https://${ep.host}${upstreamPath} (${newBody.length} bytes, stream=${!!parsed.stream})`);
+
+  const upstream = https.request(options, (upstreamRes) => {
+    const isSSE = (upstreamRes.headers["content-type"] || "").includes("text/event-stream");
+    const respHeaders = {
+      "Content-Type": upstreamRes.headers["content-type"] || "application/json",
+    };
+    res.writeHead(upstreamRes.statusCode, respHeaders);
+
+    if (isSSE) {
+      let buffer = "";
+      upstreamRes.on("data", (chunk) => {
+        buffer += chunk.toString();
+        const lines = buffer.split("\n");
+        buffer = lines.pop() || "";
+        for (const line of lines) {
+          if (line.startsWith("data: ")) {
+            const data = line.substring(6).trim();
+            if (data === "[DONE]") { res.write("data: [DONE]\n\n"); continue; }
+            try {
+              const event = JSON.parse(data);
+              if (event.type === "message_start" && event.message?.model) event.message.model = origModel;
+              res.write("data: " + JSON.stringify(event) + "\n\n");
+            } catch { res.write(line + "\n"); }
+          } else { res.write(line + "\n"); }
+        }
+      });
+      upstreamRes.on("end", () => { if (buffer) res.write(buffer + "\n"); res.end(); console.log("[proxy] ← stream complete"); });
+    } else {
+      let d = "";
+      upstreamRes.on("data", (c) => (d += c));
+      upstreamRes.on("end", () => {
+        console.log(`[proxy] ← ${upstreamRes.statusCode >= 400 ? "ERR" : "OK"} ${upstreamRes.statusCode} (${d.length} bytes)`);
+        try {
+          const resp = JSON.parse(d);
+          resp.model = origModel;
+          res.end(JSON.stringify(resp));
+        } catch { res.end(d); }
+      });
+    }
+  });
+
+  upstream.on("error", (err) => {
+    console.error("[proxy] upstream error:", err.message);
+    if (!res.headersSent) res.writeHead(502, { "Content-Type": "application/json" });
+    res.end(JSON.stringify({ type: "error", error: { message: err.message } }));
+  });
+  upstream.write(newBody);
+  upstream.end();
+}
+
+function sendOpenCodeRequest(ep, parsed, req, res, origModel) {
+  const openAIBody = anthropicToOpenAIBody(parsed);
+  const newBody = JSON.stringify(openAIBody);
+  const upstreamPath = ep.basePath;
+
+  const options = {
+    hostname: ep.host,
+    port: 443,
+    path: upstreamPath,
+    method: "POST",
+    // Security: Do not forward client-supplied API key; use only configured key
+    headers: {
+      "Content-Type": "application/json",
+      "Content-Length": Buffer.byteLength(newBody),
+      "Authorization": "Bearer " + (ep.apiKey || ""),
+    },
+  };
+
+  console.log(`[proxy] [OPENCODE] model: ${parsed.model} (from ${origModel})`);
+  console.log(`[proxy] [OPENCODE] → POST https://${ep.host}${upstreamPath} (${newBody.length} bytes, stream=${!!parsed.stream})`);
+
+  const upstream = https.request(options, (upstreamRes) => {
+    const isSSE = (upstreamRes.headers["content-type"] || "").includes("text/event-stream");
+
+    if (upstreamRes.statusCode >= 400) {
+      let errBuf = "";
+      upstreamRes.on("data", (c) => (errBuf += c));
+      upstreamRes.on("end", () => {
+        console.error(`[proxy] [OPENCODE] ⚠ ERROR ${upstreamRes.statusCode}: ${errBuf.substring(0, 500)}`);
+        if (!res.headersSent) {
+          res.writeHead(upstreamRes.statusCode, {
+            "Content-Type": "application/json"
+            // "Access-Control-Allow-Origin": "*" // DISABLED: Prevent Confused Deputy attacks from browsers
+          });
+        }
+        res.end(JSON.stringify({ type: "error", error: { message: `opencode API ${upstreamRes.statusCode}` } }));
+      });
+      return;
+    }
+
+    if (isSSE) {
+      res.writeHead(200, {
+        "Content-Type": "text/event-stream"
+        // "Access-Control-Allow-Origin": "*" // DISABLED: Prevent Confused Deputy attacks from browsers
+      });
+
+      let buffer = "";
+      const sseState = { started: false };
+
+      upstreamRes.on("data", (chunk) => {
+        buffer += chunk.toString();
+        const lines = buffer.split("\n");
+        buffer = lines.pop() || "";
+        for (const line of lines) {
+          if (line.startsWith("data: ")) {
+            const data = line.substring(6).trim();
+            if (data === "[DONE]") { res.write("data: [DONE]\n\n"); continue; }
+            try {
+              const chunkEvent = JSON.parse(data);
+              const events = openAIChunkToAnthropicSSE(chunkEvent, origModel, sseState) || [];
+              for (const ev of events) {
+                if (ev.type === "message_start" && ev.message?.model) ev.message.model = origModel;
+                res.write("data: " + JSON.stringify(ev) + "\n\n");
+              }
+            } catch { res.write(line + "\n"); }
+          } else { res.write(line + "\n"); }
+        }
+      });
+
+      upstreamRes.on("end", () => {
+        if (buffer) res.write(buffer + "\n");
+        res.end();
+        console.log(`[proxy] [OPENCODE] ← stream complete`);
+      });
+    } else {
+      const respHeaders = {
+        "Content-Type": "application/json"
+        // "Access-Control-Allow-Origin": "*" // DISABLED: Prevent Confused Deputy attacks from browsers
+      };
+      res.writeHead(upstreamRes.statusCode, respHeaders);
+
+      let d = "";
+      upstreamRes.on("data", (c) => (d += c));
+      upstreamRes.on("end", () => {
+        console.log(`[proxy] [OPENCODE] ← ${upstreamRes.statusCode} (${d.length} bytes)`);
+        try {
+          const raw = JSON.parse(d);
+          const anthropicResp = openAIToAnthropicResponse(raw, origModel);
+          res.end(JSON.stringify(anthropicResp));
+        } catch { res.end(d); }
+      });
+    }
+  });
+
+  upstream.on("error", (err) => {
+    console.error("[proxy] [OPENCODE] upstream error:", err.message);
+    if (!res.headersSent) res.writeHead(502, { "Content-Type": "application/json" });
+    res.end(JSON.stringify({ type: "error", error: { message: err.message } }));
+  });
+
+  upstream.write(newBody);
+  upstream.end();
+}
+
 // ── Image pipeline ─────────────────────────────────────────
 function handleImagePipeline(req, res, parsed, origModel) {
   const geminiEp = ENDPOINTS.gemini;
-  const deepseekEp = ENDPOINTS.deepseek;
+  // Use whichever text backend is actually configured (DeepSeek or OpenCode
+  // Go) for the follow-up completion, instead of assuming DeepSeek.
+  const textKey = getPrimaryTextEndpoint();
+  const textEp = ENDPOINTS[textKey];
 
-  console.log(`[proxy] [IMAGE] === Image → Gemini OCR → DeepSeek pipeline ===`);
+  console.log(`[proxy] [IMAGE] === Image → Gemini OCR → ${textEp.label} pipeline ===`);
 
   const geminiBody = anthropicToGeminiContents(parsed, origModel);
   const geminiBodyStr = JSON.stringify(geminiBody);
@@ -432,8 +646,8 @@ function handleImagePipeline(req, res, parsed, origModel) {
         console.log(`[proxy] [IMAGE] description (${imageDescription.length} chars): ${imageDescription.substring(0, 200)}...`);
       }
 
-      const dsModel = deepseekEp.modelMap[origModel] || deepseekEp.defaultModel;
-      parsed.model = dsModel;
+      const textModel = textEp.modelMap[origModel] || textEp.defaultModel;
+      parsed.model = textModel;
 
       if (!parsed.max_tokens || parsed.max_tokens < 1024) parsed.max_tokens = 8192;
 
@@ -473,69 +687,13 @@ function handleImagePipeline(req, res, parsed, origModel) {
         }
       }
 
-      console.log(`[proxy] [IMAGE] model map: ${origModel} → ${dsModel}`);
+      console.log(`[proxy] [IMAGE] model map: ${origModel} → ${textModel} (${textEp.label})`);
 
-      const newBody = JSON.stringify(parsed);
-      const dsPath = deepseekEp.basePath + req.url.split("?")[0];
-      const dsOpts = {
-        hostname: deepseekEp.host, port: 443, path: dsPath, method: "POST",
-        headers: {
-          "Content-Type": "application/json",
-          "Content-Length": Buffer.byteLength(newBody),
-          "x-api-key": deepseekEp.apiKey || "",
-          "anthropic-version": req.headers["anthropic-version"] || "2023-06-01",
-        },
-      };
-
-      console.log(`[proxy] [IMAGE] forwarding to DeepSeek (${newBody.length} bytes, stream=${!!parsed.stream})`);
-
-      const dsReq = https.request(dsOpts, (dsRes) => {
-        const isSSE = (dsRes.headers["content-type"] || "").includes("text/event-stream");
-        res.writeHead(dsRes.statusCode, {
-          "Content-Type": dsRes.headers["content-type"] || "application/json",
-          // "Access-Control-Allow-Origin": "*", // DISABLED: Prevent Confused Deputy attacks from browsers
-        });
-
-        if (isSSE) {
-          let buf = "";
-          dsRes.on("data", (chunk) => {
-            buf += chunk.toString();
-            const lines = buf.split("\n");
-            buf = lines.pop() || "";
-            for (const line of lines) {
-              if (line.startsWith("data: ")) {
-                const d = line.substring(6).trim();
-                if (d === "[DONE]") { res.write("data: [DONE]\n\n"); continue; }
-                try {
-                  const ev = JSON.parse(d);
-                  if (ev.type === "message_start" && ev.message?.model) ev.message.model = origModel;
-                  res.write("data: " + JSON.stringify(ev) + "\n\n");
-                } catch { res.write(line + "\n"); }
-              } else { res.write(line + "\n"); }
-            }
-          });
-          dsRes.on("end", () => { if (buf) res.write(buf + "\n"); res.end(); console.log("[proxy] [IMAGE] DeepSeek stream complete"); });
-        } else {
-          let dd = "";
-          dsRes.on("data", (c) => (dd += c));
-          dsRes.on("end", () => {
-            console.log(`[proxy] [IMAGE] DeepSeek response: ${dsRes.statusCode} (${dd.length} bytes)`);
-            try {
-              const r = JSON.parse(dd);
-              r.model = origModel;
-              res.end(JSON.stringify(r));
-            } catch { res.end(dd); }
-          });
-        }
-      });
-
-      dsReq.on("error", (e) => {
-        console.error("[proxy] [IMAGE] deepseek error:", e.message);
-        if (!res.headersSent) res.writeHead(502, { "Content-Type": "application/json" });
-        res.end(JSON.stringify({ type: "error", error: { message: e.message } }));
-      });
-      dsReq.write(newBody);
-      dsReq.end();
+      if (textEp.type === "anthropic") {
+        sendAnthropicRequest(textEp, parsed, req, res, origModel);
+      } else {
+        sendOpenCodeRequest(textEp, parsed, req, res, origModel);
+      }
     });
   });
 
@@ -652,74 +810,8 @@ function handleRequest(req, res) {
     if (ep.type === "anthropic") {
       parsed.model = upstreamModel;
       console.log(`[proxy] model map: ${origModel} → ${upstreamModel}`);
-
       if (!parsed.max_tokens || parsed.max_tokens < 1024) parsed.max_tokens = 8192;
-
-      const newBody = JSON.stringify(parsed);
-      const upstreamPath = ep.basePath + req.url.split("?")[0];
-      const options = {
-        hostname: ep.host,
-        port: 443,
-        path: upstreamPath,
-        method: "POST",
-        // Security: Do not forward client-supplied API key; use only configured key
-        headers: {
-          "Content-Type": "application/json",
-          "Content-Length": Buffer.byteLength(newBody),
-          "x-api-key": ep.apiKey || "",
-          "anthropic-version": req.headers["anthropic-version"] || "2023-06-01",
-        },
-      };
-
-      console.log(`[proxy] → POST https://${ep.host}${upstreamPath} (${newBody.length} bytes, stream=${!!parsed.stream})`);
-
-      const upstream = https.request(options, (upstreamRes) => {
-        const isSSE = (upstreamRes.headers["content-type"] || "").includes("text/event-stream");
-        const respHeaders = {
-          "Content-Type": upstreamRes.headers["content-type"] || "application/json",
-        };
-        res.writeHead(upstreamRes.statusCode, respHeaders);
-
-        if (isSSE) {
-          let buffer = "";
-          upstreamRes.on("data", (chunk) => {
-            buffer += chunk.toString();
-            const lines = buffer.split("\n");
-            buffer = lines.pop() || "";
-            for (const line of lines) {
-              if (line.startsWith("data: ")) {
-                const data = line.substring(6).trim();
-                if (data === "[DONE]") { res.write("data: [DONE]\n\n"); continue; }
-                try {
-                  const event = JSON.parse(data);
-                  if (event.type === "message_start" && event.message?.model) event.message.model = origModel;
-                  res.write("data: " + JSON.stringify(event) + "\n\n");
-                } catch { res.write(line + "\n"); }
-              } else { res.write(line + "\n"); }
-            }
-          });
-          upstreamRes.on("end", () => { if (buffer) res.write(buffer + "\n"); res.end(); console.log("[proxy] ← stream complete"); });
-        } else {
-          let d = "";
-          upstreamRes.on("data", (c) => (d += c));
-          upstreamRes.on("end", () => {
-            console.log(`[proxy] ← ${upstreamRes.statusCode >= 400 ? "ERR" : "OK"} ${upstreamRes.statusCode} (${d.length} bytes)`);
-            try {
-              const resp = JSON.parse(d);
-              resp.model = origModel;
-              res.end(JSON.stringify(resp));
-            } catch { res.end(d); }
-          });
-        }
-      });
-
-      upstream.on("error", (err) => {
-        console.error("[proxy] upstream error:", err.message);
-        if (!res.headersSent) res.writeHead(502, { "Content-Type": "application/json" });
-        res.end(JSON.stringify({ type: "error", error: { message: err.message } }));
-      });
-      upstream.write(newBody);
-      upstream.end();
+      sendAnthropicRequest(ep, parsed, req, res, origModel);
       return;
     }
 
@@ -727,116 +819,11 @@ function handleRequest(req, res) {
     if (ep.type === "opencode") {
       parsed.model = upstreamModel;
       if (!parsed.max_tokens || parsed.max_tokens < 1024) parsed.max_tokens = 8192;
-
-      const openAIBody = anthropicToOpenAIBody(parsed);
-      const newBody = JSON.stringify(openAIBody);
-      const upstreamPath = ep.basePath;
-
-      const options = {
-        hostname: ep.host,
-        port: 443,
-        path: upstreamPath,
-        method: "POST",
-        // Security: Do not forward client-supplied API key; use only configured key
-        headers: {
-          "Content-Type": "application/json",
-          "Content-Length": Buffer.byteLength(newBody),
-          "Authorization": "Bearer " + (ep.apiKey || ""),
-        },
-      };
-
-      console.log(`[proxy] [OPENCODE] model map: ${origModel} → ${upstreamModel}`);
-      console.log(`[proxy] [OPENCODE] → POST https://${ep.host}${upstreamPath} (${newBody.length} bytes, stream=${!!parsed.stream})`);
-
-      const upstream = https.request(options, (upstreamRes) => {
-        const isSSE = (upstreamRes.headers["content-type"] || "").includes("text/event-stream");
-
-        if (upstreamRes.statusCode >= 400) {
-          let errBuf = "";
-          upstreamRes.on("data", (c) => (errBuf += c));
-          upstreamRes.on("end", () => {
-            console.error(`[proxy] [OPENCODE] ⚠ ERROR ${upstreamRes.statusCode}: ${errBuf.substring(0, 500)}`);
-            if (!res.headersSent) {
-              res.writeHead(upstreamRes.statusCode, { 
-                "Content-Type": "application/json" 
-                // "Access-Control-Allow-Origin": "*" // DISABLED: Prevent Confused Deputy attacks from browsers
-              });
-            }
-            res.end(JSON.stringify({ type: "error", error: { message: `opencode API ${upstreamRes.statusCode}` } }));
-          });
-          return;
-        }
-
-        if (isSSE) {
-          res.writeHead(200, { 
-            "Content-Type": "text/event-stream" 
-            // "Access-Control-Allow-Origin": "*" // DISABLED: Prevent Confused Deputy attacks from browsers
-          });
-
-          let buffer = "";
-          const sseState = { started: false, blockStarted: false };
-
-          upstreamRes.on("data", (chunk) => {
-            buffer += chunk.toString();
-            const lines = buffer.split("\n");
-            buffer = lines.pop() || "";
-            for (const line of lines) {
-              if (line.startsWith("data: ")) {
-                const data = line.substring(6).trim();
-                if (data === "[DONE]") { res.write("data: [DONE]\n\n"); continue; }
-                try {
-                  const chunkEvent = JSON.parse(data);
-                  const events = openAIChunkToAnthropicSSE(chunkEvent, origModel, sseState);
-                  if (Array.isArray(events)) {
-                    for (const ev of events) {
-                      if (ev.type === "message_start" && ev.message?.model) ev.message.model = origModel;
-                      res.write("data: " + JSON.stringify(ev) + "\n\n");
-                    }
-                  } else if (events) {
-                    res.write("data: " + JSON.stringify(events) + "\n\n");
-                  }
-                } catch { res.write(line + "\n"); }
-              } else { res.write(line + "\n"); }
-            }
-          });
-
-          upstreamRes.on("end", () => {
-            if (buffer) res.write(buffer + "\n");
-            res.end();
-            console.log(`[proxy] [OPENCODE] ← stream complete`);
-          });
-        } else {
-          const respHeaders = { 
-            "Content-Type": "application/json" 
-            // "Access-Control-Allow-Origin": "*" // DISABLED: Prevent Confused Deputy attacks from browsers
-          };
-          res.writeHead(upstreamRes.statusCode, respHeaders);
-
-          let d = "";
-          upstreamRes.on("data", (c) => (d += c));
-          upstreamRes.on("end", () => {
-            console.log(`[proxy] [OPENCODE] ← ${upstreamRes.statusCode} (${d.length} bytes)`);
-            try {
-              const raw = JSON.parse(d);
-              const anthropicResp = openAIToAnthropicResponse(raw, origModel);
-              res.end(JSON.stringify(anthropicResp));
-            } catch { res.end(d); }
-          });
-        }
-      });
-
-      upstream.on("error", (err) => {
-        console.error("[proxy] [OPENCODE] upstream error:", err.message);
-        if (!res.headersSent) res.writeHead(502, { "Content-Type": "application/json" });
-        res.end(JSON.stringify({ type: "error", error: { message: err.message } }));
-      });
-
-      upstream.write(newBody);
-      upstream.end();
+      sendOpenCodeRequest(ep, parsed, req, res, origModel);
       return;
     }
 
-    // ── Image → Gemini OCR → DeepSeek pipeline ─────
+    // ── Image → Gemini OCR → text-backend pipeline ─────
     if (ep.type === "gemini") {
       handleImagePipeline(req, res, parsed, origModel);
       return;
