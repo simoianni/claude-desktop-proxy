@@ -1,10 +1,11 @@
-# Claude Desktop → DeepSeek / Gemini Proxy
+# Claude Desktop → DeepSeek / OpenCode Go / Gemini Proxy
 
-A local HTTPS proxy that lets **Claude Desktop** use **DeepSeek** and **Google Gemini Flash 2.5** APIs instead of Anthropic's official API — for a fraction of the cost.
+A local HTTPS proxy that lets **Claude Desktop** use **DeepSeek**, **OpenCode Go**, and **Google Gemini Flash 2.5** APIs instead of Anthropic's official API — for a fraction of the cost.
 
 ```
-Claude Desktop → HTTPS (127.0.0.1:8877) → Local proxy ─┬─→ DeepSeek API  (text & reasoning)
-                                                        └─→ Gemini Flash  (images & OCR)
+                                                        ┌─→ DeepSeek API    (text & reasoning)
+Claude Desktop → HTTPS (127.0.0.1:8877) → Local proxy ─┼─→ OpenCode Go     (text & reasoning, alternative)
+                                                        └─→ Gemini Flash   (images & OCR)
 ```
 
 ## What you need
@@ -12,11 +13,11 @@ Claude Desktop → HTTPS (127.0.0.1:8877) → Local proxy ─┬─→ DeepSeek 
 | Requirement | Notes |
 |---|---|
 | **Node.js v18+** | The setup script installs it automatically if missing (Windows) |
-| **DeepSeek API key** | https://platform.deepseek.com — free credits on signup |
-| **Gemini API key** | https://aistudio.google.com/apikey — 1000 req/day free, no credit card |
+| **A text-provider API key** | Either **DeepSeek** (https://platform.deepseek.com — free credits on signup) **or** **OpenCode Go** (https://opencode.ai) — pick one during setup |
+| **Gemini API key** | https://aistudio.google.com/apikey — 1000 req/day free, no credit card, always required (used for image OCR) |
 | **Claude Desktop** | Already installed |
 
-> **Alternative LLM:** instead of DeepSeek you can use **OpenCode Go** (opencode.ai). The setup script lets you choose.
+> **DeepSeek vs OpenCode Go:** both are Anthropic/OpenAI-compatible backends for text & reasoning. DeepSeek talks the proxy's native Anthropic-style format; **OpenCode Go** (opencode.ai) is routed through an OpenAI-compatible endpoint and is automatically translated to/from the Anthropic format by the proxy. The setup script asks you to choose one as your primary provider — you only need one key, not both. If `OPENCODE_API_KEY` is set, the proxy prefers OpenCode Go over DeepSeek for text requests.
 
 ---
 
@@ -31,13 +32,14 @@ setup.bat
 Double-click `setup.bat` or run it from a terminal. The script will:
 
 1. Install Node.js automatically if not found (via winget)
-2. Ask for your API keys and create `.env`
-3. Generate TLS certificates (no OpenSSL needed — pure PowerShell)
-4. Install the CA certificate in the Windows trust store
-5. Write Claude Desktop config files
-6. **Start the proxy** so Claude Desktop can connect immediately
-7. Walk you through the two manual steps in Claude Desktop
-8. Optionally register an auto-start task at Windows login
+2. Ask you to choose a text provider — **DeepSeek** or **OpenCode Go**
+3. Ask for your API keys (chosen provider + Gemini) and create `.env`
+4. Generate TLS certificates (no OpenSSL needed — pure PowerShell)
+5. Install the CA certificate in the Windows trust store
+6. Write Claude Desktop config files
+7. **Start the proxy** so Claude Desktop can connect immediately
+8. Walk you through the two manual steps in Claude Desktop
+9. Optionally register an auto-start task at Windows login
 
 ### Linux / macOS
 
@@ -52,13 +54,14 @@ Same flow — the script handles everything interactively.
 
 ## Model mapping
 
-| Model in Claude Desktop | Backend | Use for |
-|---|---|---|
-| `claude-sonnet-4-5` | DeepSeek V4 Flash (or OpenCode) | Text, reasoning, chat |
-| `claude-opus-4-7` | DeepSeek V4 Pro (or OpenCode) | Complex reasoning |
-| Images (auto-routed) | **Gemini Flash 2.5** | OCR, image analysis, vision |
+| Model in Claude Desktop | Backend (DeepSeek) | Backend (OpenCode Go) | Use for |
+|---|---|---|---|
+| `claude-sonnet-4-5` / `claude-sonnet-4-6` | DeepSeek V4 Flash | `deepseek-v4-flash` | Text, reasoning, chat |
+| `claude-opus-4-7` | DeepSeek V4 Pro | `deepseek-v4-flash` | Complex reasoning |
+| `claude-haiku-4-5-20251001` | DeepSeek V4 Flash | `deepseek-v4-flash` | Fast/cheap tasks |
+| Images (auto-routed) | **Gemini Flash 2.5** | **Gemini Flash 2.5** | OCR, image analysis, vision |
 
-Images are auto-detected — no manual model switching needed. Just use `claude-sonnet-4-5` for everything.
+Only one text backend is active at a time, based on which API key is configured in `.env` — **OpenCode Go takes priority over DeepSeek if both keys are present**. Images are always auto-detected and routed to Gemini regardless of the text backend, no manual model switching needed. Just use `claude-sonnet-4-5` for everything.
 
 ---
 
@@ -157,16 +160,17 @@ This fork implements several security fixes to ensure the proxy is safe for loca
 ### 1. Clone and configure keys
 
 ```bash
-git clone https://github.com/iannuz92/claude-deepseek-proxy.git
+git clone https://github.com/simoianni/claude-deepseek-proxy.git
 cd claude-deepseek-proxy
 cp .env.example .env    # Linux/macOS
 copy .env.example .env  # Windows
 ```
 
-Edit `.env`:
+Edit `.env` — set **one** of the two text-provider keys (`DEEPSEEK_API_KEY` or `OPENCODE_API_KEY`), plus Gemini:
 ```env
-DEEPSEEK_API_KEY=sk-...   # https://platform.deepseek.com
-GEMINI_API_KEY=...         # https://aistudio.google.com/apikey
+DEEPSEEK_API_KEY=sk-...          # https://platform.deepseek.com
+OPENCODE_API_KEY=...             # https://opencode.ai — alternative to DeepSeek, takes priority if set
+GEMINI_API_KEY=...               # https://aistudio.google.com/apikey
 ```
 
 ### 2. Generate TLS certificates
@@ -248,3 +252,5 @@ Quit Claude Desktop completely (tray too), reopen it, and select one of the conf
 - **Why a local CA?** Claude Desktop's sandbox strictly verifies TLS chains. A self-signed cert without `CA:TRUE` in Basic Constraints is rejected.
 - **Probe interception:** Claude Desktop sends `max_tokens=1` requests to validate connectivity. The proxy responds locally without hitting upstream APIs.
 - **Port 8877:** Arbitrary — change it in `proxy/server.js` and in Claude Desktop settings.
+- **OpenCode Go format translation:** DeepSeek speaks the proxy's native Anthropic-style messages format directly. OpenCode Go is OpenAI-compatible instead, so the proxy converts requests (`anthropicToOpenAIBody`) and responses (`openAIToAnthropicResponse` / SSE chunk translation) on the fly, including tool calls and streaming — Claude Desktop never sees the difference.
+- **Text-provider selection:** configured in `proxy/server.js` under `ENDPOINTS` / `resolveEndpoint()`. Order of preference is OpenCode Go → DeepSeek → Gemini (for images); OpenCode Go is only used if `OPENCODE_API_KEY` is set in `.env`.
