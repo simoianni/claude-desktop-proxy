@@ -160,8 +160,8 @@ This fork implements several security fixes to ensure the proxy is safe for loca
 ### 1. Clone and configure keys
 
 ```bash
-git clone https://github.com/simoianni/claude-deepseek-proxy.git
-cd claude-deepseek-proxy
+git clone https://github.com/simoianni/claude-desktop-proxy.git
+cd claude-desktop-proxy
 cp .env.example .env    # Linux/macOS
 copy .env.example .env  # Windows
 ```
