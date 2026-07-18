@@ -55,13 +55,35 @@ const ENDPOINTS = {
     defaultModel: "deepseek-v4-flash",
     type: "opencode",
   },
+  glm: {
+    label: "GLM (Z.ai)",
+    host: "api.z.ai",
+    basePath: "/api/anthropic/v1",
+    apiKey: process.env.GLM_API_KEY || null,
+    modelMap: {
+      "claude-sonnet-4-5": "glm-5-turbo",
+      "claude-sonnet-4-6": "glm-5-turbo",
+      "claude-opus-4-7": "glm-5.2",
+      "claude-haiku-4-5-20251001": "glm-4.5-air",
+    },
+    defaultModel: "glm-5-turbo",
+    type: "anthropic",
+  },
 };
 // ─────────────────────────────────────────────────────────
 
-// The text backend the user actually configured (OpenCode Go takes priority
-// over DeepSeek if both keys are present, mirroring resolveEndpoint()).
+// Mutually exclusive text providers, in priority order when more than one
+// key happens to be configured. GLM and DeepSeek both speak the proxy's
+// native Anthropic-style format (type: "anthropic"); OpenCode Go needs the
+// OpenAI-format conversion (type: "opencode").
+const TEXT_PROVIDER_PRIORITY = ["opencode", "glm", "deepseek"];
+
+// The text backend the user actually configured.
 function getPrimaryTextEndpoint() {
-  return ENDPOINTS.opencode.apiKey ? "opencode" : "deepseek";
+  for (const key of TEXT_PROVIDER_PRIORITY) {
+    if (ENDPOINTS[key].apiKey) return key;
+  }
+  return "deepseek"; // last-resort default if nothing is configured
 }
 
 // Load TLS certs
@@ -84,12 +106,10 @@ function resolveEndpoint(parsed) {
     }
   }
 
-  // Prefer opencode over deepseek when API key is configured
-  const endpointOrder = ["opencode", "deepseek", "gemini"];
-  for (const key of endpointOrder) {
+  // Route to whichever configured text provider is highest-priority for this model.
+  for (const key of TEXT_PROVIDER_PRIORITY) {
     const ep = ENDPOINTS[key];
-    if (!ep) continue;
-    if (key === "opencode" && !ep.apiKey) continue;
+    if (!ep.apiKey) continue;
     if (ep.modelMap && ep.modelMap[origModel]) return { key, ep, upstreamModel: ep.modelMap[origModel] };
   }
   // Unknown model id: fall back to whichever text provider is actually configured,
@@ -751,7 +771,8 @@ function handleRequest(req, res) {
     return res.end(JSON.stringify({
       status: "ok",
       proxy: "claude-deepseek-proxy",
-      endpoints: "DeepSeek + Gemini Flash (auto image routing) + OpenCode Go",
+      endpoints: "DeepSeek + OpenCode Go + GLM (Z.ai) + Gemini Flash (auto image routing)",
+      activeTextBackend: ENDPOINTS[getPrimaryTextEndpoint()].label,
       models,
     }));
   }
@@ -902,11 +923,12 @@ function startServer() {
   const server = https.createServer(tlsOptions, handleRequest);
   // Security: Bind server to localhost only to prevent external access
 server.listen(PROXY_PORT, "127.0.0.1", () => {
+    const activeKey = getPrimaryTextEndpoint();
+    const activeEp = ENDPOINTS[activeKey];
     console.log(`\n  Claude → Multi-Backend Proxy (HTTPS)`);
     console.log(`  Listening:    https://127.0.0.1:${PROXY_PORT}`);
-    console.log(`  DeepSeek:     text only`);
+    console.log(`  Text backend: ${activeEp.label}${activeEp.apiKey ? "" : "  ⚠ no API key configured!"}`);
     console.log(`  Gemini Flash: auto image/OCR routing`);
-    console.log(`  OpenCode Go:  OpenAI-compatible (deepseek-v4-flash)`);
     for (const [key, ep] of Object.entries(ENDPOINTS)) {
       if (ep.modelMap) {
         for (const [cModel, uModel] of Object.entries(ep.modelMap)) {

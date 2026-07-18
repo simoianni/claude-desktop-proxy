@@ -82,16 +82,20 @@ choose_llm_provider() {
   echo -e "  ${CYAN}2) OpenCode Go${NC} (opencode.ai — OpenAI-compatible)"
   echo -e "     Alternative provider, hosts DeepSeek models"
   echo ""
-  
+  echo -e "  ${CYAN}3) GLM (Z.ai)${NC} (z.ai — Anthropic-compatible, GLM Coding Plan)"
+  echo -e "     Cheap coding-focused plan, GLM-5.2 / GLM-5-Turbo models"
+  echo ""
+
   while true; do
-    read -p "  Choose [1] DeepSeek or [2] OpenCode Go: " LLM_CHOICE
+    read -p "  Choose [1] DeepSeek, [2] OpenCode Go, or [3] GLM: " LLM_CHOICE
     case "$LLM_CHOICE" in
       1|"") LLM_PROVIDER="deepseek"; break ;;
       2) LLM_PROVIDER="opencode"; break ;;
-      *) echo -e "  ${RED}Please choose 1 or 2${NC}" ;;
+      3) LLM_PROVIDER="glm"; break ;;
+      *) echo -e "  ${RED}Please choose 1, 2, or 3${NC}" ;;
     esac
   done
-  
+
   echo ""
   echo -e "  ${GREEN}✓${NC} Selected: ${BOLD}${LLM_PROVIDER}${NC}"
   echo ""
@@ -113,6 +117,17 @@ ask_api_keys() {
     fi
     llm_key_line="OPENCODE_API_KEY=$OPENCODE_KEY"
     llm_key_desc="# OpenCode Go API Key (https://opencode.ai)"
+  elif [ "$LLM_PROVIDER" = "glm" ]; then
+    echo "  LLM provider: GLM (Z.ai)"
+    echo "  → Get your API key at: https://z.ai (GLM Coding Plan)"
+    echo ""
+    read -p "  GLM API key: " GLM_KEY
+    if [ -z "$GLM_KEY" ]; then
+      echo -e "${RED}✗ GLM API key is required.${NC}"
+      exit 1
+    fi
+    llm_key_line="GLM_API_KEY=$GLM_KEY"
+    llm_key_desc="# GLM / Z.ai API Key (https://z.ai)"
   else
     echo "  LLM provider: DeepSeek API"
     echo "  → Get your API key at: https://platform.deepseek.com"
